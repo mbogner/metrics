@@ -1,0 +1,248 @@
+services:
+
+  # POSTGRES
+  postgres:
+    image: postgres:16-alpine
+    container_name: metrics_postgres
+    hostname: metrics_postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - postgres:/var/lib/postgresql/data:rw
+    environment:
+      POSTGRES_DB: db
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: s3cr3t
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_MULTIPLE_DATABASES: keycloak,filestorage
+      TZ: UTC
+      PGTZ: UTC
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U admin -d db" ]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+
+  # http://127.0.0.1:9187
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    container_name: metrics_postgres-exporter
+    hostname: metrics_postgres-exporter
+    ports:
+      - "127.0.0.1:9187:9187"
+    environment:
+      DATA_SOURCE_NAME: postgresql://admin:s3cr3t@postgres:5432/db?sslmode=disable
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: nc -z -v postgres-exporter 9187 || exit 1
+      interval: 1s
+      timeout: 5s
+      retries: 10
+
+  # http://127.0.0.1:8025
+  mail:
+    build: mailhog/mailhog
+    image: spring-cloud-mailhog:latest
+    container_name: metrics_mail
+    hostname: metrics_mail
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    environment:
+      MH_HOSTNAME: mail.mbo.dev
+    healthcheck:
+      test: wget --spider --tries 1 http://smtp:pass123@localhost:8025
+      interval: 1s
+      timeout: 1s
+      start_interval: 1s
+      retries: 5
+
+  # http://127.0.0.1:9093
+  alert-manager:
+    image: prom/alertmanager:latest
+    container_name: metrics_alert-manager
+    hostname: metrics_alert-manager
+    ports:
+      - "127.0.0.1:9093:9093"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./conf/prometheus/alertmanager.yml:/etc/alertmanager/config.yml:ro
+      - alertmanager:/alertmanager:rw
+    command:
+      - '--config.file=/etc/alertmanager/config.yml'
+      - '--storage.path=/alertmanager'
+    depends_on:
+      mail:
+        condition: service_healthy
+    healthcheck:
+      test: nc -z alert-manager 9093 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  # http://127.0.0.1:9090
+  # https://hub.docker.com/r/prom/prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: metrics_prometheus
+    hostname: metrics_prometheus
+    command:
+      - --web.console.templates=/etc/prometheus/consoles
+      - --web.console.libraries=/etc/prometheus/console_libraries
+      - --storage.tsdb.retention.time=1h
+      - --config.file=/etc/prometheus/prometheus.yaml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+      - --web.route-prefix=/
+      - --enable-feature=exemplar-storage
+      - --enable-feature=otlp-write-receiver
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./conf/prometheus/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
+      - ./conf/prometheus/prometheus.rules.yml:/etc/prometheus/prometheus.rules.yml:ro
+      - prometheus:/prometheus:rw
+    ports:
+      - "127.0.0.1:9090:9090"
+    healthcheck:
+      test: nc -z prometheus 9090 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  # http://127.0.0.1:16686
+  # https://www.jaegertracing.io/docs/1.50/getting-started/
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: metrics_jaeger
+    hostname: metrics_jaeger
+    command:
+      - "--memory.max-traces=8000"
+      - "--prometheus.server-url=http://prometheus:9090"
+      - "--prometheus.query.normalize-calls=true"
+      - "--prometheus.query.normalize-duration=true"
+    environment:
+      METRICS_STORAGE_TYPE: prometheus
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      - "127.0.0.1:16686:16686" # UI
+    healthcheck:
+      test: nc -z localhost 16686 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+    depends_on:
+      prometheus:
+        condition: service_healthy
+
+  # http://127.0.0.1:3100
+  loki:
+    image: grafana/loki:latest
+    container_name: metrics_loki
+    hostname: metrics_loki
+    ports:
+      - "127.0.0.1:3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./conf/loki.yml:/etc/loki/local-config.yaml:ro
+    healthcheck:
+      test: nc -z loki 3100 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+    depends_on:
+      alert-manager:
+        condition: service_healthy
+
+  # http://localhost:55679/debug/tracez
+  otel:
+    build: ./conf/otel
+    image: metrics-otel:latest
+    container_name: metrics_otel
+    hostname: metrics_otel
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - ./conf/otel/collector-gateway.yaml:/etc/collector-gateway.yaml
+    command: [ "--config=/etc/collector-gateway.yaml" ]
+    ports:
+      - "127.0.0.1:8888:8888"   # Prometheus metrics exposed by the collector -> http://127.0.0.1:8888/metrics
+      - "127.0.0.1:8889:8889"   # Prometheus exporter metrics
+      - "127.0.0.1:1888:1888"   # pprof extension
+      - "127.0.0.1:13133:13133" # health_check extension
+      - "127.0.0.1:4317:4317"   # OTLP gRPC receiver
+      - "127.0.0.1:4318:4318"   # OTLP HTTP receiver
+      - "127.0.0.1:55679:55679" # zpages extension
+    depends_on:
+      jaeger:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+    healthcheck:
+      test: nc -z localhost 4317 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
+  # http://127.0.0.1:3000
+  grafana:
+    image: grafana/grafana-oss:latest
+    container_name: metrics_grafana
+    hostname: metrics_grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+      - grafana:/var/lib/grafana:rw
+      - ./conf/grafana.ini:/usr/share/grafana/conf/grafana-local.ini:ro
+    environment:
+      GF_INSTALL_PLUGINS: ""
+      GF_PATHS_CONFIG: /usr/share/grafana/conf/grafana-local.ini
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: s3cr3t
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    healthcheck:
+      test: nc -z localhost 3000 || exit 1
+      interval: 1s
+      timeout: 2s
+      retries: 10
+    entrypoint:
+      - sh
+      - -euc
+      - |
+        mkdir -p /etc/grafana/provisioning/datasources
+        cat <<EOF > /etc/grafana/provisioning/datasources/ds.yaml
+        apiVersion: 1
+        datasources:
+        - name: Loki
+          type: loki
+          access: proxy
+          orgId: 1
+          url: http://loki:3100
+          basicAuth: false
+          isDefault: true
+          version: 1
+          editable: false
+        EOF
+        /run.sh
+
+
+
+volumes:
+  postgres:
+  alertmanager:
+  prometheus:
+  grafana:
